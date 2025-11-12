@@ -1,4 +1,4 @@
-# meridian-stream
+# meridian-stream-go
 
 **Resilient SSE streaming for distributed Go applications.**
 
@@ -21,7 +21,7 @@ import (
     "fmt"
     "time"
 
-    mstream "github.com/haowjy/meridian-stream"
+    mstream "github.com/haowjy/meridian-stream-go"
 )
 
 func main() {
@@ -51,8 +51,8 @@ func main() {
 ```go
 import (
     "net/http"
-    mstream "github.com/haowjy/meridian-stream"
-    nethttpadapter "github.com/haowjy/meridian-stream/adapters/nethttp"
+    mstream "github.com/haowjy/meridian-stream-go"
+    nethttpadapter "github.com/haowjy/meridian-stream-go/adapters/nethttp"
 )
 
 func main() {

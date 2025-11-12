@@ -10,14 +10,14 @@ import (
 
 	"github.com/google/uuid"
 
-	mstream "github.com/haowjy/meridian-stream"
-	nethttpadapter "github.com/haowjy/meridian-stream/adapters/nethttp"
+	mstream "github.com/haowjy/meridian-stream-go"
+	nethttpadapter "github.com/haowjy/meridian-stream-go/adapters/nethttp"
 )
 
 func main() {
 	registry := mstream.NewRegistry(
-		mstream.WithCleanupInterval(1 * time.Minute),
-		mstream.WithRetentionPeriod(10 * time.Minute),
+		mstream.WithCleanupInterval(1*time.Minute),
+		mstream.WithRetentionPeriod(10*time.Minute),
 	)
 
 	// Start cleanup goroutine

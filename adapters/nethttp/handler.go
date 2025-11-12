@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"net/http"
 
-	mstream "github.com/haowjy/meridian-stream"
+	mstream "github.com/haowjy/meridian-stream-go"
 )
 
 // Handler creates an http.Handler for SSE streaming

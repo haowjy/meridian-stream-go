@@ -4,6 +4,6 @@ go 1.22
 
 toolchain go1.24.7
 
-replace github.com/haowjy/meridian-stream => ../..
+replace github.com/haowjy/meridian-stream-go => ../..
 
-require github.com/haowjy/meridian-stream v0.0.0
+require github.com/haowjy/meridian-stream-go v0.0.0

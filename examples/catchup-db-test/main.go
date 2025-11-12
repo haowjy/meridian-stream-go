@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	mstream "github.com/haowjy/meridian-stream"
+	mstream "github.com/haowjy/meridian-stream-go"
 )
 
 // Simulated database storage
