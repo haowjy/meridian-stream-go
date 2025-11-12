@@ -231,12 +231,19 @@ func (s *Stream) GetEventsSince(lastEventID string) []Event {
 // buffer or the catchup function (for database-backed replay).
 //
 // Flow:
-// 1. Check if lastEventID exists in buffer
+// 1. If lastEventID is empty (first connection): call catchup function + return full buffer
+// 2. Check if lastEventID exists in buffer
 //    - If found: return events from buffer
 //    - If not found: call catchup function, then append current buffer
 func (s *Stream) GetCatchupEvents(lastEventID string) []Event {
 	if lastEventID == "" {
-		return nil
+		// First connection - get all events from beginning
+		var catchupEvents []Event
+		if s.catchupFunc != nil {
+			catchupEvents, _ = s.catchupFunc(s.id, "")
+		}
+		currentBuffer := s.buffer.GetAll()
+		return append(catchupEvents, currentBuffer...)
 	}
 
 	// First, try to find in buffer
