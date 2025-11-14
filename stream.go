@@ -2,6 +2,7 @@ package rstream
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -50,14 +51,20 @@ type Stream struct {
 	// Event buffer for catchup (pluggable storage)
 	buffer Buffer
 
+	// Catchup coordination (prevents race between DB query and buffer read)
+	catchupMu sync.RWMutex
+
 	// Status tracking
 	status   Status
 	statusMu sync.RWMutex
 	err      error
 
 	// Configuration
-	bufferSize int
-	timeout    time.Duration
+	bufferSize       int
+	timeout          time.Duration
+	enableEventIDs   bool  // DEBUG mode: emit event IDs in SSE stream
+	eventIDCounter   int64 // Sequential counter for event IDs (when enabled)
+	eventIDMu        sync.Mutex // Protects eventIDCounter for thread-safe generation
 
 	// Hooks
 	onComplete CompleteFunc
@@ -140,6 +147,14 @@ func (s *Stream) execute() {
 
 // broadcast sends an event to all connected clients and stores in buffer
 func (s *Stream) broadcast(event Event) {
+	// Generate event ID if DEBUG mode is enabled
+	if s.enableEventIDs && event.ID == "" {
+		s.eventIDMu.Lock()
+		s.eventIDCounter++
+		event.ID = fmt.Sprintf("%d", s.eventIDCounter)
+		s.eventIDMu.Unlock()
+	}
+
 	// Store in buffer for catchup
 	s.buffer.Add(event)
 
@@ -235,7 +250,14 @@ func (s *Stream) GetEventsSince(lastEventID string) []Event {
 // 2. Check if lastEventID exists in buffer
 //    - If found: return events from buffer
 //    - If not found: call catchup function, then append current buffer
+//
+// The catchupMu ensures atomic view of persisted blocks (via catchupFunc) and buffer state,
+// preventing race conditions where buffer is cleared between DB query and buffer read.
 func (s *Stream) GetCatchupEvents(lastEventID string) []Event {
+	// Lock for entire catchup operation to prevent races with buffer clear
+	s.catchupMu.RLock()
+	defer s.catchupMu.RUnlock()
+
 	if lastEventID == "" {
 		// First connection - get all events from beginning
 		var catchupEvents []Event
@@ -282,7 +304,12 @@ func (s *Stream) SnapshotBuffer() []Event {
 //   events := stream.SnapshotBuffer()
 //   db.SaveTurnBlock(events)  // Persist FIRST
 //   stream.ClearBuffer()      // Clear AFTER
+//
+// The catchupMu write lock prevents concurrent GetCatchupEvents() calls
+// from seeing inconsistent state during buffer clear.
 func (s *Stream) ClearBuffer() {
+	s.catchupMu.Lock()
+	defer s.catchupMu.Unlock()
 	s.buffer.Clear()
 }
 
@@ -291,20 +318,28 @@ func (s *Stream) ClearBuffer() {
 // race conditions where clients reconnecting during persistence lose events.
 //
 // The persist function receives a snapshot of the current buffer and should
-// return an error if persistence fails. If an error is returned, the buffer
-// is NOT cleared.
+// return an error if persistence fails. The function MUST block until the database
+// commit completes (or fails). If an error is returned, the buffer is NOT cleared.
+//
+// The catchupMu write lock is held during both persistence and buffer clear,
+// ensuring GetCatchupEvents() sees a consistent view (either events in buffer
+// OR events in database, never missing).
 //
 // Example:
 //   err := stream.PersistAndClear(func(events []Event) error {
 //       return db.SaveTurnBlock(turnID, events)
 //   })
 func (s *Stream) PersistAndClear(persistFn func([]Event) error) error {
-	// Snapshot buffer
+	// Snapshot buffer (no lock needed for snapshot)
 	events := s.SnapshotBuffer()
 
 	if len(events) == 0 {
 		return nil // Nothing to persist
 	}
+
+	// Lock to ensure atomicity with GetCatchupEvents()
+	s.catchupMu.Lock()
+	defer s.catchupMu.Unlock()
 
 	// Persist FIRST (blocks until database commit)
 	if err := persistFn(events); err != nil {
@@ -312,7 +347,9 @@ func (s *Stream) PersistAndClear(persistFn func([]Event) error) error {
 	}
 
 	// Only clear if persistence succeeded
-	s.ClearBuffer()
+	// Note: ClearBuffer() normally acquires catchupMu, but we already hold it
+	// So we call buffer.Clear() directly to avoid deadlock
+	s.buffer.Clear()
 	return nil
 }
 

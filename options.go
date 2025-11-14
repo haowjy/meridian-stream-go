@@ -69,3 +69,27 @@ func WithBuffer(buffer Buffer) StreamOption {
 		s.buffer = buffer
 	}
 }
+
+// WithEventIDs enables DEBUG mode where sequential event IDs are emitted
+// in the SSE stream. This is useful for debugging and development, but should
+// typically be disabled in production for simplicity and performance.
+//
+// When enabled:
+//   - Events will have sequential IDs: "1", "2", "3", ...
+//   - SSE clients receive "id:" field for Last-Event-ID tracking
+//   - Slightly more memory usage and processing
+//
+// When disabled (default):
+//   - No event IDs emitted
+//   - Catchup still works based on turn/block IDs from database
+//   - Simpler, faster, less memory
+//
+// Example:
+//   stream := NewStream(id, workFunc,
+//       WithEventIDs(config.Debug),
+//   )
+func WithEventIDs(enabled bool) StreamOption {
+	return func(s *Stream) {
+		s.enableEventIDs = enabled
+	}
+}

@@ -202,6 +202,158 @@ size := stream.BufferSize()
 stream.ClearBuffer()
 ```
 
+## Advanced Features
+
+### DEBUG Mode
+
+Enable sequential event IDs for debugging and development:
+
+```bash
+# Enable DEBUG mode
+export DEBUG=true
+```
+
+**When enabled:**
+- Events get sequential IDs: `"1"`, `"2"`, `"3"`, etc.
+- Helps trace exact event order in logs
+- Useful for debugging race conditions and event sequencing
+
+**In production:**
+- Set `DEBUG=false` (or omit the variable)
+- No event IDs generated (better performance, simpler)
+- Block sequence numbers provide ordering when needed
+
+**Example output:**
+
+```
+DEBUG=true:
+event: block_start
+id: 1
+data: {"block_index": 0}
+
+event: block_delta
+id: 2
+data: {"text": "Hello"}
+
+DEBUG=false:
+event: block_start
+data: {"block_index": 0}
+
+event: block_delta
+data: {"text": "Hello"}
+```
+
+### Thread Safety Guarantees
+
+The library provides multiple levels of thread safety:
+
+#### 1. Buffer Operations (RWMutex)
+All buffer operations are thread-safe:
+- `Add()`, `GetAll()`, `GetSince()`, `Clear()` protected by RWMutex
+- Safe for concurrent reads and writes
+- Returns copies, not references (prevents external modification)
+
+#### 2. Catchup Coordination (Catchup Mutex)
+Prevents races between catchup and buffer operations:
+- `GetCatchupEvents()` is atomic with respect to buffer operations
+- `PersistAndClear()` guarantees no race between persist and clear
+- Ensures consistent view of database + buffer state
+
+```go
+// Internal implementation (automatic)
+func (s *Stream) GetCatchupEvents(lastEventID string) []Event {
+    s.catchupMu.Lock()
+    defer s.catchupMu.Unlock()
+
+    // Database query + buffer read now atomic
+    catchupEvents := s.catchupFunc(streamID, lastEventID)
+    currentBuffer := s.buffer.GetAll()
+    return append(catchupEvents, currentBuffer...)
+}
+```
+
+#### 3. Multi-Client Broadcasting
+Safe for concurrent clients:
+- Multiple clients can connect to same stream
+- Events broadcast atomically to all clients
+- Automatic cleanup of disconnected clients
+
+### Race Condition Prevention
+
+**Problem:** Buffer cleared before database commit completes
+
+Without proper coordination, this race can occur:
+
+```
+T0: Block completes, DB write starts
+T1: Buffer cleared ← TOO EARLY!
+T2: Client reconnects
+T3: Catchup queries DB (not committed yet)
+T4: Client gets NOTHING (data loss!)
+T5: DB commit completes (too late)
+```
+
+**Solution: Atomic PersistAndClear**
+
+```go
+// ❌ BAD: Race condition possible
+events := stream.SnapshotBuffer()
+db.Save(events)
+stream.ClearBuffer()  // May clear before DB commit!
+
+// ✅ GOOD: Atomic persist-and-clear
+stream.PersistAndClear(func(events []mstream.Event) error {
+    return db.Save(events)  // Buffer cleared ONLY if this succeeds
+})
+```
+
+**How it works:**
+
+1. **Catchup mutex locks** - Prevents concurrent catchup during persist
+2. **Persist executes** - Your function commits to database
+3. **On success** - Buffer cleared automatically
+4. **On failure** - Buffer retained, error returned
+5. **Mutex unlocks** - Catchup can now proceed
+
+**Timeline with fix:**
+
+```
+T0: Block completes, PersistAndClear called
+T1: Catchup mutex locked
+T2: DB write executes
+T3: Client reconnects (waits for mutex)
+T4: DB commit succeeds
+T5: Buffer cleared
+T6: Mutex released
+T7: Client catchup executes (sees committed data)
+```
+
+### Configuration Options
+
+```go
+stream := mstream.NewStream(id, workFunc,
+    // Catchup function for database-backed replay
+    mstream.WithCatchup(func(streamID, lastEventID string) ([]mstream.Event, error) {
+        blocks := db.GetTurnBlocksAfter(streamID, lastEventID)
+        return toEvents(blocks), nil
+    }),
+
+    // Client channel buffer size
+    mstream.WithBufferSize(100),
+
+    // Stream timeout (auto-cleanup)
+    mstream.WithTimeout(5*time.Minute),
+
+    // Completion callback
+    mstream.WithOnComplete(func(id string) {
+        log.Printf("Stream %s completed", id)
+    }),
+
+    // Enable event IDs (DEBUG mode)
+    mstream.WithEventIDs(os.Getenv("DEBUG") == "true"),
+)
+```
+
 ## Use Cases
 
 - **LLM streaming** - Stream AI responses to users
