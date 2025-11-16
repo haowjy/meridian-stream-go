@@ -120,9 +120,21 @@ func (r *Registry) StartCleanup(ctx context.Context) {
 
 // markCompleted tracks when a stream completes
 func (r *Registry) markCompleted(id string) {
-	r.completionMu.Lock()
-	defer r.completionMu.Unlock()
-	r.completionTimes[id] = time.Now()
+	// Look up stream without holding write lock to avoid blocking other readers
+	r.mu.RLock()
+	stream, exists := r.streams[id]
+	r.mu.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	// Clear in-memory buffer now that the stream has reached a terminal state.
+	// All persisted content is in the database; we don't need the buffer for replay.
+	stream.ClearBuffer()
+
+	// Remove from registry so completed/error/cancelled streams are not kept around.
+	r.Remove(id)
 }
 
 // cleanup removes old completed streams
