@@ -133,8 +133,10 @@ func (r *Registry) markCompleted(id string) {
 	// All persisted content is in the database; we don't need the buffer for replay.
 	stream.ClearBuffer()
 
-	// Remove from registry so completed/error/cancelled streams are not kept around.
-	r.Remove(id)
+	// Track completion time - cleanup goroutine will remove after retentionPeriod
+	r.completionMu.Lock()
+	r.completionTimes[id] = time.Now()
+	r.completionMu.Unlock()
 }
 
 // cleanup removes old completed streams

@@ -55,9 +55,10 @@ type Stream struct {
 	catchupMu sync.RWMutex
 
 	// Status tracking
-	status   Status
-	statusMu sync.RWMutex
-	err      error
+	status          Status
+	statusMu        sync.RWMutex
+	err             error
+	isSoftCancelled bool // True if SoftCancel() was called (clients disconnected, but workFunc continues)
 
 	// Configuration
 	bufferSize       int
@@ -129,15 +130,20 @@ func (s *Stream) execute() {
 		s.err = err
 	} else if ctx.Err() == context.Canceled {
 		s.status = StatusCancelled
+	} else if s.isSoftCancelled {
+		// SoftCancel() already set StatusCancelled, preserve it
+		// (workFunc completed successfully but user cancelled)
+		// Status is already StatusCancelled, no change needed
 	} else {
 		s.status = StatusComplete
 	}
 	s.statusMu.Unlock()
 
 	// Call hooks
+	// For soft cancel, call onComplete so executor can save metadata and send turn_error event
 	if err != nil && s.onError != nil {
 		s.onError(s.id, err)
-	} else if s.status == StatusComplete && s.onComplete != nil {
+	} else if (s.status == StatusComplete || s.isSoftCancelled) && s.onComplete != nil {
 		s.onComplete(s.id)
 	}
 
@@ -194,9 +200,50 @@ func (s *Stream) RemoveClient(clientID string) {
 	}
 }
 
-// Cancel stops the stream
+// Cancel stops the stream by cancelling the context.
+// This triggers the workFunc to stop and the stream to transition to StatusCancelled.
 func (s *Stream) Cancel() {
 	s.cancelFunc()
+}
+
+// SoftCancel marks the stream as cancelled and disconnects all clients,
+// but does NOT cancel the context. The workFunc continues running until completion.
+//
+// Use this when:
+// - The provider doesn't support cancellation (continues billing regardless)
+// - You need final metadata from the provider (e.g., token counts)
+//
+// The stream transitions to StatusCancelled immediately and clients are disconnected.
+// The workFunc keeps running in background to capture final token metadata.
+// When workFunc completes, onComplete hook is called (to save metadata and cleanup).
+//
+// Behavior:
+// - Frontend: Disconnected immediately, sees stream close
+// - Backend: Provider continues, saves partial blocks (before cancel) and final token counts
+// - User can immediately send new messages after cancel
+func (s *Stream) SoftCancel() {
+	s.statusMu.Lock()
+	s.status = StatusCancelled
+	s.isSoftCancelled = true
+	s.statusMu.Unlock()
+
+	// Close all client channels immediately (frontend disconnected)
+	// User sees stream close and can send new messages immediately
+	s.clientsMu.Lock()
+	for clientID, ch := range s.clients {
+		close(ch)
+		delete(s.clients, clientID)
+	}
+	s.clientsMu.Unlock()
+}
+
+// IsSoftCancelled returns true if SoftCancel() was called.
+// This indicates the stream was user-cancelled but the workFunc was allowed to complete
+// (to capture final metadata like token counts).
+func (s *Stream) IsSoftCancelled() bool {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	return s.isSoftCancelled
 }
 
 // Status returns the current status
