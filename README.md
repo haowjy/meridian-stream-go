@@ -12,6 +12,7 @@ Built for [Meridian](https://meridian-flow.com) - an AI-powered writing platform
 - ✅ **Reconnection with catchup** - Clients resume seamlessly
 - ✅ **Framework agnostic** - Works with any Go HTTP framework
 - ✅ **Automatic cleanup** - Memory-safe goroutine lifecycle management
+- ✅ **Interjection support** - User input buffering during streaming
 
 ## Quick Start
 
@@ -353,6 +354,111 @@ stream := mstream.NewStream(id, workFunc,
     mstream.WithEventIDs(os.Getenv("DEBUG") == "true"),
 )
 ```
+
+## Interjection Buffer
+
+The library provides `InterjectionBuffer` for buffering user input during streaming. This enables "interjection" scenarios where users can send messages while the LLM is still responding.
+
+### Basic Usage
+
+```go
+// Create a buffer with default settings (64KB max)
+buffer := mstream.NewInMemoryInterjectionBuffer()
+
+// Append content (concatenates with newline delimiter)
+err := buffer.Append("Please stop and help me with something else")
+if err == mstream.ErrInterjectionEmpty {
+    // Content was whitespace-only
+}
+if err == mstream.ErrInterjectionTooLarge {
+    // Would exceed max buffer size
+}
+
+// Replace content (overwrites existing)
+err = buffer.Replace("Actually, just do this instead")
+
+// Check content without clearing
+content, ok := buffer.Peek()
+if ok {
+    fmt.Printf("Pending interjection: %s\n", content)
+}
+
+// Drain and clear atomically (for injection points)
+content, ok = buffer.DrainAndClear()
+if ok {
+    // Inject into LLM conversation
+    messages = append(messages, Message{Role: "user", Content: content})
+}
+```
+
+### Registry Pattern
+
+Use `InterjectionRegistry` to manage buffers across HTTP requests:
+
+```go
+registry := mstream.NewInterjectionRegistry()
+
+// HTTP handler: receive user interjection
+func handleInterjection(w http.ResponseWriter, r *http.Request) {
+    turnID := r.PathValue("turnID")
+    content := parseContent(r)
+
+    // GetOrCreate returns existing buffer or creates new one
+    buffer := registry.GetOrCreate(turnID)
+    if err := buffer.Append(content); err != nil {
+        http.Error(w, err.Error(), 400)
+        return
+    }
+
+    json.NewEncoder(w).Encode(map[string]any{
+        "status":  "queued",
+        "length":  buffer.Length(),
+    })
+}
+
+// Streaming goroutine: check for interjection at tool boundaries
+func streamingLoop(turnID string, registry *mstream.InterjectionRegistry) {
+    for {
+        // ... process tool results ...
+
+        // Check for pending interjection at boundary
+        if buffer, ok := registry.Get(turnID); ok {
+            if content, hasContent := buffer.DrainAndClear(); hasContent {
+                // Inject interjection into conversation
+                injectUserMessage(content)
+            }
+        }
+    }
+}
+
+// Cleanup when streaming completes
+registry.Remove(turnID)
+```
+
+### Custom Combiner
+
+Override how multiple appends are combined:
+
+```go
+type MarkdownCombiner struct{}
+
+func (c *MarkdownCombiner) Combine(existing, incoming string) string {
+    return existing + "\n\n---\n\n" + incoming
+}
+
+buffer := mstream.NewInMemoryInterjectionBufferWithOptions(
+    mstream.DefaultMaxInterjectionBytes,
+    &MarkdownCombiner{},
+)
+```
+
+### Thread Safety
+
+All interjection operations are thread-safe:
+- `Append`, `Replace`, `Clear` use write locks
+- `Peek`, `Length` use read locks
+- `DrainAndClear` is atomic (returns and clears in one operation)
+- `InterjectionRegistry` uses `sync.Map` for concurrent access
 
 ## Use Cases
 
