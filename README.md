@@ -2,13 +2,13 @@
 
 **Resilient SSE streaming for distributed Go applications.**
 
-Multi-client SSE streaming with reconnection support. One goroutine → many clients. Works across multiple server instances.
+Multi-client SSE streaming with reconnection support. One goroutine -> many clients. Works across multiple server instances.
 
 Built for [Meridian](https://meridian-flow.com) - an AI-powered writing platform
 
 ## Features
 
-- ✅ **Multi-client support** - One stream → many SSE connections
+- ✅ **Multi-client support** - One stream -> many SSE connections
 - ✅ **Reconnection with catchup** - Clients resume seamlessly
 - ✅ **Framework agnostic** - Works with any Go HTTP framework
 - ✅ **Automatic cleanup** - Memory-safe goroutine lifecycle management
@@ -162,8 +162,8 @@ http.HandleFunc("GET /streams/{id}", nethttpadapter.Handler(registry))
 Client reconnects with Last-Event-ID: 5
 
 1. Check in-memory buffer
-   - If event 5 found → return events 6-10 from buffer
-   - If event 5 NOT found (cleared) → call catchup function
+   - If event 5 found -> return events 6-10 from buffer
+   - If event 5 NOT found (cleared) -> call catchup function
 
 2. Catchup function queries database
    - Returns aggregated blocks as special "catchup" events
