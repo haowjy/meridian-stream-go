@@ -61,35 +61,20 @@ func WithCatchup(fn CatchupFunc) StreamOption {
 // or any other storage backend that implements the Buffer interface.
 //
 // Example with Redis:
-//   stream := NewStream(id, workFunc,
-//       WithBuffer(NewRedisBuffer(redisClient, streamID)),
-//   )
+//
+//	stream := NewStream(id, workFunc,
+//	    WithBuffer(NewRedisBuffer(redisClient, streamID)),
+//	)
 func WithBuffer(buffer Buffer) StreamOption {
 	return func(s *Stream) {
 		s.buffer = buffer
 	}
 }
 
-// WithEventIDs enables DEBUG mode where sequential event IDs are emitted
-// in the SSE stream. This is useful for debugging and development, but should
-// typically be disabled in production for simplicity and performance.
-//
-// When enabled:
-//   - Events will have sequential IDs: "1", "2", "3", ...
-//   - SSE clients receive "id:" field for Last-Event-ID tracking
-//   - Slightly more memory usage and processing
-//
-// When disabled (default):
-//   - No event IDs emitted
-//   - Catchup still works based on turn/block IDs from database
-//   - Simpler, faster, less memory
-//
-// Example:
-//   stream := NewStream(id, workFunc,
-//       WithEventIDs(config.Debug),
-//   )
-func WithEventIDs(enabled bool) StreamOption {
+// WithCompletionGracePeriod configures how long terminal stream buffers are
+// retained before automatic clear. The default is 30 seconds.
+func WithCompletionGracePeriod(period time.Duration) StreamOption {
 	return func(s *Stream) {
-		s.enableEventIDs = enabled
+		s.completionGracePeriod = period
 	}
 }

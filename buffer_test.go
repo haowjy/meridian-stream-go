@@ -1,6 +1,7 @@
 package rstream
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -77,42 +78,48 @@ func TestInMemoryBuffer_GetSince(t *testing.T) {
 
 	// Setup events
 	for i := 1; i <= 10; i++ {
-		buffer.Add(Event{ID: string(rune(i + '0')), Data: []byte("test")})
+		buffer.Add(Event{ID: fmt.Sprintf("%d", i), Data: []byte("test")})
 	}
 
 	tests := []struct {
 		name          string
-		lastEventID   string
+		lastSeq       int64
+		expectedFound bool
 		expectedCount int
 		expectedFirst string // ID of first event in result
 	}{
 		{
 			name:          "from middle (event 5)",
-			lastEventID:   "5",
+			lastSeq:       5,
+			expectedFound: true,
 			expectedCount: 5,
 			expectedFirst: "6",
 		},
 		{
 			name:          "from start (event 1)",
-			lastEventID:   "1",
+			lastSeq:       1,
+			expectedFound: true,
 			expectedCount: 9,
 			expectedFirst: "2",
 		},
 		{
 			name:          "from end (event 10)",
-			lastEventID:   string(rune(10 + '0')),
+			lastSeq:       10,
+			expectedFound: true,
 			expectedCount: 0,
 			expectedFirst: "",
 		},
 		{
-			name:          "empty ID",
-			lastEventID:   "",
+			name:          "invalid seq",
+			lastSeq:       0,
+			expectedFound: false,
 			expectedCount: 0,
 			expectedFirst: "",
 		},
 		{
-			name:          "non-existent ID",
-			lastEventID:   "999",
+			name:          "non-existent seq",
+			lastSeq:       999,
+			expectedFound: false,
 			expectedCount: 0,
 			expectedFirst: "",
 		},
@@ -120,11 +127,14 @@ func TestInMemoryBuffer_GetSince(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			events := buffer.GetSince(tt.lastEventID)
+			events, found := buffer.GetSince(tt.lastSeq)
+			if found != tt.expectedFound {
+				t.Fatalf("GetSince(%d) found=%v, expected %v", tt.lastSeq, found, tt.expectedFound)
+			}
 
 			if len(events) != tt.expectedCount {
-				t.Errorf("GetSince(%q) returned %d events, expected %d",
-					tt.lastEventID, len(events), tt.expectedCount)
+				t.Errorf("GetSince(%d) returned %d events, expected %d",
+					tt.lastSeq, len(events), tt.expectedCount)
 			}
 
 			if tt.expectedCount > 0 && events[0].ID != tt.expectedFirst {
@@ -299,7 +309,7 @@ func TestInMemoryBuffer_GetSince_ConcurrentWithAdd(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				_ = buffer.GetSince("3")
+				_, _ = buffer.GetSince(3)
 			}
 		}()
 	}
@@ -331,9 +341,12 @@ func TestInMemoryBuffer_EdgeCases(t *testing.T) {
 	buffer := NewInMemoryBuffer()
 
 	t.Run("GetSince on empty buffer", func(t *testing.T) {
-		events := buffer.GetSince("anything")
+		events, found := buffer.GetSince(1)
+		if found {
+			t.Error("GetSince on empty buffer should report found=false")
+		}
 		if events != nil {
-			t.Error("GetSince on empty buffer should return nil")
+			t.Error("GetSince on empty buffer should return nil events")
 		}
 	})
 
@@ -366,10 +379,13 @@ func TestInMemoryBuffer_EdgeCases(t *testing.T) {
 			t.Errorf("size = %d, expected 1", buffer.Size())
 		}
 
-		// GetSince with the only event should return nil
-		events := buffer.GetSince("only")
+		// Non-numeric IDs are not valid sequence IDs.
+		events, found := buffer.GetSince(1)
+		if found {
+			t.Error("GetSince should report found=false for non-sequence event IDs")
+		}
 		if events != nil {
-			t.Error("GetSince with last event should return nil")
+			t.Error("GetSince should return nil when sequence is not found")
 		}
 
 		// GetAll should return the event

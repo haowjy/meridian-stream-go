@@ -2,7 +2,11 @@ package rstream
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -20,6 +24,16 @@ const (
 	StatusComplete  Status = "complete"  // Finished successfully
 	StatusError     Status = "error"     // Encountered error
 	StatusCancelled Status = "cancelled" // Cancelled by user
+)
+
+// StreamStatus is the externally returned stream state in replay/subscription APIs.
+type StreamStatus = Status
+
+var (
+	// ErrEpochMismatch indicates the caller's epoch does not match this in-memory stream instance.
+	ErrEpochMismatch = errors.New("stream epoch mismatch")
+	// ErrSequenceNotFound indicates the requested sequence number is no longer available in buffer.
+	ErrSequenceNotFound = errors.New("sequence not found in buffer")
 )
 
 // CompleteFunc is called when execution completes successfully
@@ -48,6 +62,10 @@ type Stream struct {
 	clients   map[string]chan Event
 	clientsMu sync.RWMutex
 
+	// streamMu serializes broadcast with SubscribeWithCatchup's snapshot+subscribe step.
+	// This is the core lock that prevents catchup/live races.
+	streamMu sync.Mutex
+
 	// Event buffer for catchup (pluggable storage)
 	buffer Buffer
 
@@ -61,15 +79,23 @@ type Stream struct {
 	isSoftCancelled bool // True if SoftCancel() was called (clients disconnected, but workFunc continues)
 
 	// Configuration
-	bufferSize       int
-	timeout          time.Duration
-	enableEventIDs   bool  // DEBUG mode: emit event IDs in SSE stream
-	eventIDCounter   int64 // Sequential counter for event IDs (when enabled)
-	eventIDMu        sync.Mutex // Protects eventIDCounter for thread-safe generation
+	bufferSize int
+	timeout    time.Duration
+
+	// Replay identity and sequence tracking
+	epoch          string
+	eventIDCounter int64
+	eventIDMu      sync.Mutex
+
+	// Terminal buffer retention
+	completionGracePeriod time.Duration
+	completionMu          sync.Mutex
+	completionTimer       *time.Timer
+	isCompleted           bool
 
 	// Hooks
-	onComplete CompleteFunc
-	onError    ErrorFunc
+	onComplete  CompleteFunc
+	onError     ErrorFunc
 	catchupFunc CatchupFunc
 }
 
@@ -87,6 +113,9 @@ func NewStream(id string, workFunc WorkFunc, opts ...StreamOption) *Stream {
 		status:     StatusPending,
 		bufferSize: 20, // Default channel buffer size
 		timeout:    0,  // No timeout by default
+		epoch:      newEpoch(),
+		// Keep terminal replay data briefly so reconnecting clients can recover.
+		completionGracePeriod: 30 * time.Second,
 	}
 
 	// Apply options
@@ -137,13 +166,18 @@ func (s *Stream) execute() {
 	} else {
 		s.status = StatusComplete
 	}
+	currentStatus := s.status
+	softCancelled := s.isSoftCancelled
 	s.statusMu.Unlock()
+
+	// Mark terminal and start delayed buffer expiration.
+	s.markCompleted()
 
 	// Call hooks
 	// For soft cancel, call onComplete so executor can save metadata and send turn_error event
 	if err != nil && s.onError != nil {
 		s.onError(s.id, err)
-	} else if (s.status == StatusComplete || s.isSoftCancelled) && s.onComplete != nil {
+	} else if (currentStatus == StatusComplete || softCancelled) && s.onComplete != nil {
 		s.onComplete(s.id)
 	}
 
@@ -153,13 +187,15 @@ func (s *Stream) execute() {
 
 // broadcast sends an event to all connected clients and stores in buffer
 func (s *Stream) broadcast(event Event) {
-	// Generate event ID if DEBUG mode is enabled
-	if s.enableEventIDs && event.ID == "" {
-		s.eventIDMu.Lock()
-		s.eventIDCounter++
-		event.ID = fmt.Sprintf("%d", s.eventIDCounter)
-		s.eventIDMu.Unlock()
-	}
+	// Serialize with SubscribeWithCatchup to avoid duplicate/missed events around reconnect.
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+
+	// Event IDs are always-on and strictly monotonic within the stream.
+	s.eventIDMu.Lock()
+	s.eventIDCounter++
+	event.ID = fmt.Sprintf("%d", s.eventIDCounter)
+	s.eventIDMu.Unlock()
 
 	// Store in buffer for catchup
 	s.buffer.Add(event)
@@ -180,8 +216,21 @@ func (s *Stream) broadcast(event Event) {
 
 // AddClient registers a new client and returns their event channel
 func (s *Stream) AddClient(clientID string) <-chan Event {
+	if isTerminalStatus(s.Status()) {
+		return closedEventChannel()
+	}
+
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
+
+	if isTerminalStatus(s.Status()) {
+		return closedEventChannel()
+	}
+
+	// Replace any existing client channel for this ID.
+	if existing, exists := s.clients[clientID]; exists {
+		close(existing)
+	}
 
 	ch := make(chan Event, s.bufferSize)
 	s.clients[clientID] = ch
@@ -265,6 +314,11 @@ func (s *Stream) ID() string {
 	return s.id
 }
 
+// Epoch returns the stream instance epoch.
+func (s *Stream) Epoch() string {
+	return s.epoch
+}
+
 // ClientCount returns the number of connected clients
 func (s *Stream) ClientCount() int {
 	s.clientsMu.RLock()
@@ -283,10 +337,46 @@ func (s *Stream) closeAllClients() {
 	}
 }
 
-// GetEventsSince returns all events after the given event ID
-// Returns nil if lastEventID is empty or not found
-func (s *Stream) GetEventsSince(lastEventID string) []Event {
-	return s.buffer.GetSince(lastEventID)
+// GetEventsSince returns events after a sequence number.
+// found=false means seq is not present in the current in-memory buffer.
+func (s *Stream) GetEventsSince(seq int64) (events []Event, found bool) {
+	return s.buffer.GetSince(seq)
+}
+
+// SubscribeWithCatchup atomically snapshots catchup and registers a live channel.
+//
+// Contract:
+// - If epoch is provided and does not match the current stream epoch, returns ErrEpochMismatch.
+// - If lastSeq > 0 and not found in buffer, returns ErrSequenceNotFound.
+// - If stream is terminal, returns catchup with nil live channel and terminal status.
+// - On terminal streams, each call resets the buffer grace-period TTL.
+func (s *Stream) SubscribeWithCatchup(clientID string, lastSeq int64, epoch string) (catchup []Event, liveChan <-chan Event, status StreamStatus, err error) {
+	if epoch != "" && epoch != s.epoch {
+		return nil, nil, s.Status(), fmt.Errorf("%w: expected=%q got=%q", ErrEpochMismatch, s.epoch, epoch)
+	}
+
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+
+	status = s.Status()
+
+	if lastSeq <= 0 {
+		catchup = s.buffer.GetAll()
+	} else {
+		events, found := s.buffer.GetSince(lastSeq)
+		if !found {
+			return nil, nil, status, fmt.Errorf("%w: %d", ErrSequenceNotFound, lastSeq)
+		}
+		catchup = events
+	}
+
+	if isTerminalStatus(status) {
+		s.resetCompletionTimer()
+		return catchup, nil, status, nil
+	}
+
+	liveChan = s.addClientLocked(clientID)
+	return catchup, liveChan, status, nil
 }
 
 // GetCatchupEvents retrieves events for reconnection, using either the in-memory
@@ -295,12 +385,18 @@ func (s *Stream) GetEventsSince(lastEventID string) []Event {
 // Flow:
 // 1. If lastEventID is empty (first connection): call catchup function + return full buffer
 // 2. Check if lastEventID exists in buffer
-//    - If found: return events from buffer
-//    - If not found: call catchup function, then append current buffer
+//   - If found: return events from buffer
+//   - If not found: call catchup function, then append current buffer
 //
 // The catchupMu ensures atomic view of persisted blocks (via catchupFunc) and buffer state,
 // preventing race conditions where buffer is cleared between DB query and buffer read.
 func (s *Stream) GetCatchupEvents(lastEventID string) []Event {
+	events, _ := s.GetCatchupEventsWithError(lastEventID)
+	return events
+}
+
+// GetCatchupEventsWithError retrieves events for reconnection and returns catchup errors.
+func (s *Stream) GetCatchupEventsWithError(lastEventID string) ([]Event, error) {
 	// Lock for entire catchup operation to prevent races with buffer clear
 	s.catchupMu.RLock()
 	defer s.catchupMu.RUnlock()
@@ -309,31 +405,39 @@ func (s *Stream) GetCatchupEvents(lastEventID string) []Event {
 		// First connection - get all events from beginning
 		var catchupEvents []Event
 		if s.catchupFunc != nil {
-			catchupEvents, _ = s.catchupFunc(s.id, "")
+			var err error
+			catchupEvents, err = s.catchupFunc(s.id, "")
+			if err != nil {
+				return nil, err
+			}
 		}
 		currentBuffer := s.buffer.GetAll()
-		return append(catchupEvents, currentBuffer...)
+		return append(catchupEvents, currentBuffer...), nil
 	}
 
 	// First, try to find in buffer
-	bufferEvents := s.buffer.GetSince(lastEventID)
-
-	// Found in buffer, return those
-	if len(bufferEvents) > 0 {
-		return bufferEvents
+	if seq, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
+		bufferEvents, found := s.buffer.GetSince(seq)
+		if found {
+			return bufferEvents, nil
+		}
 	}
 
 	// Not in buffer - call catchup function if available
 	var catchupEvents []Event
 	if s.catchupFunc != nil {
-		catchupEvents, _ = s.catchupFunc(s.id, lastEventID)
+		var err error
+		catchupEvents, err = s.catchupFunc(s.id, lastEventID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Get current buffer state (events that arrived after catchup)
 	currentBuffer := s.buffer.GetAll()
 
 	// Return catchup events + current buffer
-	return append(catchupEvents, currentBuffer...)
+	return append(catchupEvents, currentBuffer...), nil
 }
 
 // SnapshotBuffer returns a copy of the current buffer without clearing it.
@@ -348,9 +452,10 @@ func (s *Stream) SnapshotBuffer() []Event {
 // otherwise clients reconnecting during persistence will lose events.
 //
 // Recommended pattern:
-//   events := stream.SnapshotBuffer()
-//   db.SaveTurnBlock(events)  // Persist FIRST
-//   stream.ClearBuffer()      // Clear AFTER
+//
+//	events := stream.SnapshotBuffer()
+//	db.SaveTurnBlock(events)  // Persist FIRST
+//	stream.ClearBuffer()      // Clear AFTER
 //
 // The catchupMu write lock prevents concurrent GetCatchupEvents() calls
 // from seeing inconsistent state during buffer clear.
@@ -373,9 +478,10 @@ func (s *Stream) ClearBuffer() {
 // OR events in database, never missing).
 //
 // Example:
-//   err := stream.PersistAndClear(func(events []Event) error {
-//       return db.SaveTurnBlock(turnID, events)
-//   })
+//
+//	err := stream.PersistAndClear(func(events []Event) error {
+//	    return db.SaveTurnBlock(turnID, events)
+//	})
 func (s *Stream) PersistAndClear(persistFn func([]Event) error) error {
 	// Snapshot buffer (no lock needed for snapshot)
 	events := s.SnapshotBuffer()
@@ -403,4 +509,79 @@ func (s *Stream) PersistAndClear(persistFn func([]Event) error) error {
 // BufferSize returns the number of events currently in the buffer
 func (s *Stream) BufferSize() int {
 	return s.buffer.Size()
+}
+
+func (s *Stream) addClientLocked(clientID string) <-chan Event {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+
+	if existing, exists := s.clients[clientID]; exists {
+		close(existing)
+	}
+
+	ch := make(chan Event, s.bufferSize)
+	s.clients[clientID] = ch
+	return ch
+}
+
+func (s *Stream) markCompleted() {
+	s.completionMu.Lock()
+	defer s.completionMu.Unlock()
+
+	s.isCompleted = true
+	s.resetCompletionTimerLocked()
+}
+
+func (s *Stream) resetCompletionTimer() {
+	s.completionMu.Lock()
+	defer s.completionMu.Unlock()
+	s.resetCompletionTimerLocked()
+}
+
+func (s *Stream) resetCompletionTimerLocked() {
+	if !s.isCompleted {
+		return
+	}
+
+	if s.completionTimer != nil {
+		s.completionTimer.Stop()
+		s.completionTimer = nil
+	}
+
+	if s.completionGracePeriod <= 0 {
+		s.ClearBuffer()
+		return
+	}
+
+	var timer *time.Timer
+	timer = time.AfterFunc(s.completionGracePeriod, func() {
+		s.ClearBuffer()
+
+		s.completionMu.Lock()
+		if s.completionTimer == timer {
+			s.completionTimer = nil
+		}
+		s.completionMu.Unlock()
+	})
+
+	s.completionTimer = timer
+}
+
+func isTerminalStatus(status Status) bool {
+	return status == StatusComplete || status == StatusError || status == StatusCancelled
+}
+
+func closedEventChannel() <-chan Event {
+	ch := make(chan Event)
+	close(ch)
+	return ch
+}
+
+func newEpoch() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-derived string if random source is unavailable.
+		return fmt.Sprintf("epoch-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }

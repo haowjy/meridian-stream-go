@@ -165,27 +165,21 @@ func TestWithCatchup(t *testing.T) {
 	}
 }
 
-func TestWithEventIDs(t *testing.T) {
+func TestWithCompletionGracePeriod(t *testing.T) {
 	workFunc := func(ctx context.Context, send func(Event)) error {
 		return nil
 	}
 
-	// Default: event IDs disabled
+	// Default: 30 seconds
 	stream := NewStream("test-default", workFunc)
-	if stream.enableEventIDs {
-		t.Error("expected enableEventIDs to be false by default")
+	if stream.completionGracePeriod != 30*time.Second {
+		t.Errorf("expected default grace period 30s, got %v", stream.completionGracePeriod)
 	}
 
-	// Enabled
-	stream = NewStream("test-enabled", workFunc, WithEventIDs(true))
-	if !stream.enableEventIDs {
-		t.Error("expected enableEventIDs to be true")
-	}
-
-	// Explicitly disabled
-	stream = NewStream("test-disabled", workFunc, WithEventIDs(false))
-	if stream.enableEventIDs {
-		t.Error("expected enableEventIDs to be false")
+	// Custom value
+	stream = NewStream("test-custom", workFunc, WithCompletionGracePeriod(5*time.Second))
+	if stream.completionGracePeriod != 5*time.Second {
+		t.Errorf("expected grace period 5s, got %v", stream.completionGracePeriod)
 	}
 }
 
@@ -216,7 +210,7 @@ func TestMultipleOptions(t *testing.T) {
 	stream := NewStream("test-multi", workFunc,
 		WithBufferSize(50),
 		WithTimeout(10*time.Second),
-		WithEventIDs(true),
+		WithCompletionGracePeriod(2*time.Second),
 		WithOnComplete(func(id string) { completeCalled = true }),
 		WithOnError(func(id string, err error) { errorCalled = true }),
 	)
@@ -228,8 +222,8 @@ func TestMultipleOptions(t *testing.T) {
 	if stream.timeout != 10*time.Second {
 		t.Errorf("expected timeout 10s, got %v", stream.timeout)
 	}
-	if !stream.enableEventIDs {
-		t.Error("expected enableEventIDs to be true")
+	if stream.completionGracePeriod != 2*time.Second {
+		t.Errorf("expected grace period 2s, got %v", stream.completionGracePeriod)
 	}
 
 	stream.Start()

@@ -1,6 +1,9 @@
 package rstream
 
-import "sync"
+import (
+	"strconv"
+	"sync"
+)
 
 // Buffer defines the interface for event storage.
 // Implementations must be thread-safe for concurrent access.
@@ -11,9 +14,10 @@ type Buffer interface {
 	// GetAll returns all events currently in the buffer
 	GetAll() []Event
 
-	// GetSince returns events after the given event ID.
-	// Returns nil if lastEventID is empty, not found, or there are no events after it.
-	GetSince(lastEventID string) []Event
+	// GetSince returns events after the given sequence number.
+	// found=false means seq was not found in the buffer.
+	// found=true with events=nil means seq was found, but there are no events after it.
+	GetSince(seq int64) (events []Event, found bool)
 
 	// Clear removes all events from the buffer
 	Clear()
@@ -57,35 +61,42 @@ func (b *InMemoryBuffer) GetAll() []Event {
 	return result
 }
 
-// GetSince returns events after the given event ID.
-// Returns nil if lastEventID is not found or there are no events after it.
-func (b *InMemoryBuffer) GetSince(lastEventID string) []Event {
+// GetSince returns events after the given sequence number.
+// found=false means seq does not exist in the current buffer snapshot.
+func (b *InMemoryBuffer) GetSince(seq int64) (events []Event, found bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	if lastEventID == "" {
-		return nil
+	if seq <= 0 {
+		return nil, false
 	}
+
+	targetID := strconv.FormatInt(seq, 10)
 
 	// Find the last event
 	lastIndex := -1
 	for i, event := range b.events {
-		if event.ID == lastEventID {
+		if event.ID == targetID {
 			lastIndex = i
 			break
 		}
 	}
 
-	// Event not found or no events after it
-	if lastIndex == -1 || lastIndex+1 >= len(b.events) {
-		return nil
+	// Event not found
+	if lastIndex == -1 {
+		return nil, false
+	}
+
+	// Event found, but no events after it
+	if lastIndex+1 >= len(b.events) {
+		return nil, true
 	}
 
 	// Return events after lastIndex
 	remaining := b.events[lastIndex+1:]
 	result := make([]Event, len(remaining))
 	copy(result, remaining)
-	return result
+	return result, true
 }
 
 // Clear removes all events from the buffer

@@ -57,7 +57,10 @@ func StreamSSE(ctx context.Context, w SSEWriter, stream *Stream, opts ...SSEOpti
 	// Send catchup events if Last-Event-ID is provided
 	// This will check in-memory buffer first, then fall back to catchup function
 	if config.lastEventID != "" {
-		catchupEvents := stream.GetCatchupEvents(config.lastEventID)
+		catchupEvents, err := stream.GetCatchupEventsWithError(config.lastEventID)
+		if err != nil {
+			return err
+		}
 		for _, event := range catchupEvents {
 			if err := writeSSEEvent(w, event); err != nil {
 				return err

@@ -67,10 +67,18 @@ func (r *Registry) Register(stream *Stream) error {
 	r.streams[stream.ID()] = stream
 
 	// Set up completion tracking hooks
+	existingOnComplete := stream.onComplete
 	stream.onComplete = func(id string) {
+		if existingOnComplete != nil {
+			existingOnComplete(id)
+		}
 		r.markCompleted(id)
 	}
+	existingOnError := stream.onError
 	stream.onError = func(id string, err error) {
+		if existingOnError != nil {
+			existingOnError(id, err)
+		}
 		r.markCompleted(id)
 	}
 
@@ -122,16 +130,12 @@ func (r *Registry) StartCleanup(ctx context.Context) {
 func (r *Registry) markCompleted(id string) {
 	// Look up stream without holding write lock to avoid blocking other readers
 	r.mu.RLock()
-	stream, exists := r.streams[id]
+	_, exists := r.streams[id]
 	r.mu.RUnlock()
 
 	if !exists {
 		return
 	}
-
-	// Clear in-memory buffer now that the stream has reached a terminal state.
-	// All persisted content is in the database; we don't need the buffer for replay.
-	stream.ClearBuffer()
 
 	// Track completion time - cleanup goroutine will remove after retentionPeriod
 	r.completionMu.Lock()
