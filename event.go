@@ -10,7 +10,7 @@ type Event struct {
 	// ID is an optional event identifier for Last-Event-ID tracking
 	ID string
 
-	// Type is an optional event type for SSE event field
+	// Type is an optional event type label.
 	Type string
 
 	// Retry is optional retry timeout in milliseconds

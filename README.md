@@ -1,16 +1,15 @@
 # meridian-stream-go
 
-**Resilient SSE streaming for distributed Go applications.**
+**Resilient in-memory stream fanout for Go applications.**
 
-Multi-client SSE streaming with reconnection support. One goroutine -> many clients. Works across multiple server instances.
+Multi-client event streaming with reconnection catchup support. One goroutine -> many clients.
 
 Built for [Meridian](https://meridian-flow.com) - an AI-powered writing platform
 
 ## Features
 
-- ✅ **Multi-client support** - One stream -> many SSE connections
+- ✅ **Multi-client support** - One stream -> many subscribers
 - ✅ **Reconnection with catchup** - Clients resume seamlessly
-- ✅ **Framework agnostic** - Works with any Go HTTP framework
 - ✅ **Automatic cleanup** - Memory-safe goroutine lifecycle management
 - ✅ **Interjection support** - User input buffering during streaming
 
@@ -47,47 +46,6 @@ func main() {
 }
 ```
 
-## With net/http
-
-```go
-import (
-    "net/http"
-    mstream "github.com/haowjy/meridian-stream-go"
-    nethttpadapter "github.com/haowjy/meridian-stream-go/adapters/nethttp"
-)
-
-func main() {
-    registry := mstream.NewRegistry()
-
-    // Start cleanup goroutine
-    go registry.StartCleanup(context.Background())
-
-    // Create stream endpoint
-    http.HandleFunc("POST /streams", func(w http.ResponseWriter, r *http.Request) {
-        streamID := generateID()
-
-        stream := mstream.NewStream(streamID, func(ctx context.Context, send func(mstream.Event)) error {
-            // Your streaming logic here
-            return nil
-        })
-
-        registry.Register(stream)
-        stream.Start()
-
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
-            "stream_id": streamID,
-            "stream_url": fmt.Sprintf("/streams/%s", streamID),
-        })
-    })
-
-    // SSE endpoint (Go 1.22+ routing)
-    http.HandleFunc("GET /streams/{id}", nethttpadapter.Handler(registry))
-
-    http.ListenAndServe(":3000", nil)
-}
-```
-
 ## With Reconnection/Catchup
 
 The library provides **two-tier catchup**: in-memory buffer for recent events, with database fallback for cleared events.
@@ -96,25 +54,7 @@ The library provides **two-tier catchup**: in-memory buffer for recent events, w
 
 1. **In-memory buffer**: Fast catchup for recent events still in buffer
 2. **Database fallback**: When buffer is cleared, query database for aggregated blocks
-3. **Automatic**: net/http adapter handles `Last-Event-ID` header automatically
-
-### Client Side
-
-```javascript
-// Browser EventSource automatically sends Last-Event-ID on reconnection
-const eventSource = new EventSource('/streams/abc123');
-
-// Handle both live deltas and aggregated catchup blocks
-eventSource.addEventListener('text_delta', (e) => {
-    const delta = JSON.parse(e.data);
-    editor.insertText(delta.text);  // Animate character by character
-});
-
-eventSource.addEventListener('turnblock_catchup', (e) => {
-    const block = JSON.parse(e.data);
-    editor.insertText(block.content);  // Insert entire block at once
-});
-```
+3. **Caller-managed transport**: attach these events to WebSocket, HTTP streaming, or any custom transport
 
 ### Server Side
 
@@ -152,8 +92,6 @@ if err := db.SaveTurnBlock(turnID, events); err != nil {
 }
 stream.ClearBuffer()  // Only clear after successful persist
 
-// The adapter automatically handles reconnection:
-http.HandleFunc("GET /streams/{id}", nethttpadapter.Handler(registry))
 ```
 
 ### Catchup Flow
@@ -491,4 +429,3 @@ PRs welcome! This is primarily maintained for Meridian's needs, but happy to acc
 ## License
 
 MIT
-
